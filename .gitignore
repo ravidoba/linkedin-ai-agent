@@ -1,0 +1,40 @@
+# Python
+.venv/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Environment secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*credentials*
+*secrets*
+
+# Browser sessions
+browser-profile/
+playwright/.auth/
+storage_state.json
+cookies.json
+
+# Generated files
+linkedin_jobs.json
+dom_report.json
+*.log
+
+# Node.js
+node_modules/
+.next/
+dist/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.dbjob_api_responses.json
+all_api_responses.json
