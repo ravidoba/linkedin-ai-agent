@@ -12,6 +12,7 @@ class AIMatchResult(BaseModel):
     missing_skills: list[str]
     experience_match: bool | None = None
     years_of_experience: float | None = None
+    required_experience_years: float | None = None
     explanation: str
     needs_review: bool = False
 
@@ -23,6 +24,7 @@ def review_result(message: str) -> dict:
         "missing_skills": [],
         "experience_match": None,
         "years_of_experience": None,
+        "required_experience_years": None,
         "explanation": message,
         "needs_review": True,
     }
@@ -47,12 +49,16 @@ Compare the candidate's resume against the job description.
 IMPORTANT RULES:
 1. Use only qualifications supported by the resume.
 2. Never invent skills, experience, or certifications.
-3. Evaluate technical skills, experience, and mandatory requirements.
-4. Calculate a match score between 0 and 100.
-5. Missing mandatory requirements must reduce the score.
-6. If experience is unknown, use null.
-7. experience_match must be true, false, or null.
-8. years_of_experience must be a number or null.
+3. Evaluate required technical skills and experience separately.
+4. List ONLY technical skills the job description states as required/mandatory.
+   Ignore preferred, optional, "nice to have" or "plus" skills.
+   Put each required skill in matched_skills if the resume supports it, otherwise in missing_skills.
+5. match_score is the percentage (0-100) of required skills that are matched.
+6. required_experience_years is the MINIMUM years of experience the job requires
+   (for "3-5 years" use 3, for "5+ years" use 5), or null if the job does not state it.
+7. years_of_experience is the candidate's total professional experience in years,
+   calculated only from the resume's dates, or null if it cannot be determined.
+8. experience_match must be true, false, or null.
 9. If information is insufficient, set needs_review to true.
 10. Return ONLY valid JSON.
 11. Do not include markdown, comments, or text outside JSON.
@@ -64,6 +70,7 @@ REQUIRED JSON FORMAT:
     "missing_skills": [],
     "experience_match": null,
     "years_of_experience": null,
+    "required_experience_years": null,
     "explanation": "",
     "needs_review": false
 }}
@@ -88,7 +95,28 @@ JOB DESCRIPTION:
             parsed_response
         )
 
-        return result.model_dump()
+        data = result.model_dump()
+
+        # Skills: percentage of required skills supported by the resume.
+        matched = {s.strip().lower() for s in data["matched_skills"] if s.strip()}
+        missing = {s.strip().lower() for s in data["missing_skills"] if s.strip()} - matched
+        if not matched and not missing:
+            return review_result("No required skills could be determined from the job description.")
+        data["match_score"] = round(len(matched) / (len(matched) + len(missing)) * 100)
+
+        # Experience: candidate years must meet the job's minimum; unknown stays uncertain.
+        have = data["years_of_experience"]
+        need = data["required_experience_years"]
+        if have is not None and need is not None:
+            data["experience_match"] = have >= need
+        else:
+            data["experience_match"] = None
+            data["needs_review"] = True
+            data["explanation"] = (
+                data["explanation"] + " Experience requirement could not be confirmed."
+            ).strip()
+
+        return data
 
     except (json.JSONDecodeError, ValidationError):
         return review_result(

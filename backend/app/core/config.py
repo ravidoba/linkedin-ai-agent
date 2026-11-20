@@ -18,6 +18,9 @@ class Settings(BaseSettings):
     OLLAMA_BASE_URL: str = "http://localhost:11434"
     OLLAMA_MODEL: str = "qwen3:4b"
 
+    # Comma-separated extra origins allowed by CORS (in addition to the Vite dev origin).
+    CORS_ALLOWED_ORIGINS: str = ""
+
     model_config = SettingsConfigDict(
         env_file=".env",
         extra="ignore"
