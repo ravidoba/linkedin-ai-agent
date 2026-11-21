@@ -21,6 +21,16 @@ class Settings(BaseSettings):
     # Comma-separated extra origins allowed by CORS (in addition to the Vite dev origin).
     CORS_ALLOWED_ORIGINS: str = ""
 
+    # User-provided Easy Apply answers (README.md manual flow); override in .env.
+    APPLY_TOTAL_EXPERIENCE_YEARS: str = "5"
+    APPLY_SKILL_EXPERIENCE_YEARS: str = "5"  # Java / backend / frontend / full stack / software dev
+    APPLY_CURRENT_SALARY: str = "30 LPA"
+    APPLY_EXPECTED_SALARY: str = "50 LPA"
+    APPLY_NOTICE_PERIOD: str = "Less than 15 days"
+    # Start-button runs click Submit as soon as a form is complete (user's choice).
+    # Set to false in .env to pause on the Review page for approval instead.
+    APPLY_AUTO_SUBMIT: bool = True
+
     model_config = SettingsConfigDict(
         env_file=".env",
         extra="ignore"

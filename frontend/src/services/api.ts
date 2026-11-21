@@ -90,7 +90,7 @@ function httpErrorMessage(status: number, detail: string | undefined): string {
 }
 
 export interface RequestOptions {
-  method?: "GET" | "POST" | "DELETE";
+  method?: "GET" | "POST" | "PUT" | "DELETE";
   /** JSON-serialised unless it is FormData. */
   body?: unknown;
   timeoutMs?: number;
@@ -302,6 +302,131 @@ export async function getCurrentUser(signal?: AbortSignal): Promise<AuthUser> {
   };
 }
 
+export interface RunLogEntry {
+  id: number;
+  type: string;
+  status: string;
+  message: string;
+  step: string | null;
+  result: "Applied" | "Skipped" | "Failed" | null;
+  job_number: number | null;
+  job_total: number | null;
+  job_title: string | null;
+  job_company: string | null;
+  created_at: string | null;
+}
+
+export interface RunLogs {
+  run: { id: number; job_count: number; status: string; created_at: string | null } | null;
+  logs: RunLogEntry[];
+}
+
+export interface RunSummary {
+  id: number;
+  job_count: number;
+  status: string;
+  created_at: string | null;
+  applied: number;
+  skipped: number;
+  failed: number;
+}
+
+export interface ProfileSkill {
+  name: string;
+  years: number | null;
+}
+
+export interface ProfileEducation {
+  degree: string;
+  level: "phd" | "master" | "bachelor" | "diploma" | "other";
+  field: string;
+}
+
+export interface ResumeProfile {
+  resume_id: number;
+  skills: ProfileSkill[];
+  total_experience_years: number | null;
+  education: ProfileEducation[];
+  current_role: string | null;
+  edited_by_user: boolean;
+  updated_at: string | null;
+}
+
+export type ResumeProfileUpdate = Pick<
+  ResumeProfile,
+  "skills" | "total_experience_years" | "education" | "current_role"
+>;
+
+// Reading a resume with the AI model can take up to a minute.
+const PROFILE_TIMEOUT_MS = 120_000;
+
+function parseProfile(data: unknown, path: string): ResumeProfile {
+  const p = data as Partial<ResumeProfile> | null;
+  if (!p || !Array.isArray(p.skills) || !Array.isArray(p.education)) {
+    throw new ApiError("invalid_response", `Unexpected ${path} response shape.`);
+  }
+  return p as ResumeProfile;
+}
+
+/** GET /resumes/{id}/profile — built from the resume on first use. */
+export async function getResumeProfile(resumeId: number): Promise<ResumeProfile> {
+  const path = `/resumes/${resumeId}/profile`;
+  return parseProfile(await apiRequest(path, { timeoutMs: PROFILE_TIMEOUT_MS }), path);
+}
+
+/** PUT /resumes/{id}/profile — save the user's edits. */
+export async function saveResumeProfile(
+  resumeId: number,
+  update: ResumeProfileUpdate,
+): Promise<ResumeProfile> {
+  const path = `/resumes/${resumeId}/profile`;
+  return parseProfile(await apiRequest(path, { method: "PUT", body: update }), path);
+}
+
+/** POST /resumes/{id}/profile/rebuild — read the resume again (replaces edits only when confirmed). */
+export async function rebuildResumeProfile(
+  resumeId: number,
+  overwriteEdits: boolean,
+): Promise<ResumeProfile> {
+  const path = `/resumes/${resumeId}/profile/rebuild?overwrite_edits=${overwriteEdits}`;
+  return parseProfile(
+    await apiRequest(path, { method: "POST", timeoutMs: PROFILE_TIMEOUT_MS }),
+    path,
+  );
+}
+
+/** POST /ai/runs/stop — "stopping" (running run ends before its next job),
+ * "stopped" (a paused run was ended), or "idle" (no run was active). */
+export async function stopRun(): Promise<"stopping" | "stopped" | "idle"> {
+  const data = (await apiRequest("/ai/runs/stop", { method: "POST" })) as
+    | { status?: string }
+    | null;
+  const status = data?.status;
+  if (status !== "stopping" && status !== "stopped" && status !== "idle") {
+    throw new ApiError("invalid_response", "Unexpected /ai/runs/stop response shape.");
+  }
+  return status;
+}
+
+/** GET /ai/runs — the user's Start runs, newest first. */
+export async function listRuns(signal?: AbortSignal): Promise<RunSummary[]> {
+  const data = (await apiRequest("/ai/runs", { signal })) as { runs?: RunSummary[] } | null;
+  if (!data || !Array.isArray(data.runs)) {
+    throw new ApiError("invalid_response", "Unexpected /ai/runs response shape.");
+  }
+  return data.runs;
+}
+
+/** GET /ai/runs/logs — saved logs of one Start run (latest when runId is omitted). */
+export async function getRunLogs(runId?: number, signal?: AbortSignal): Promise<RunLogs> {
+  const query = runId !== undefined ? `?run_id=${runId}` : "";
+  const data = (await apiRequest(`/ai/runs/logs${query}`, { signal })) as Partial<RunLogs> | null;
+  if (!data || !Array.isArray(data.logs)) {
+    throw new ApiError("invalid_response", "Unexpected /ai/runs/logs response shape.");
+  }
+  return { run: data.run ?? null, logs: data.logs };
+}
+
 /** Client-side logout. */
 export function logout(): void {
   clearAccessToken();
@@ -416,6 +541,7 @@ export interface AgentReply {
   pending_questions: PendingQuestion[];
   missing_fields: string[];
   error_type: string | null;
+  run_id: number | null;
 }
 
 const AGENT_TIMEOUT_MS: number =
@@ -438,6 +564,7 @@ export async function sendAgentPrompt(
   conversationId: string,
   signal?: AbortSignal,
   resume?: AgentResume,
+  jobCount?: number,
 ): Promise<AgentReply> {
   const data = await apiRequest("/ai/agent", {
     method: "POST",
@@ -445,6 +572,7 @@ export async function sendAgentPrompt(
       message,
       ...(resumeId !== null ? { resume_id: resumeId } : {}),
       conversation_id: conversationId,
+      ...(jobCount !== undefined ? { job_count: jobCount } : {}),
       ...resume,
     },
     timeoutMs: AGENT_TIMEOUT_MS,
@@ -474,6 +602,7 @@ export async function sendAgentPrompt(
       : [],
     error_type:
       typeof r.error_type === "string" ? r.error_type : null,
+    run_id: typeof r.run_id === "number" ? r.run_id : null,
   };
 }
 

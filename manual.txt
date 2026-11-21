@@ -1,0 +1,30 @@
+Linkedin Job Apply Manual Flow.
+---------------
+[1] Open Brouser.
+[2] Open Linkedin website.
+[3] Search button : enter Java.
+[4] Click on Jobs Tab.
+[5] Data Posted : Select Past 24 hours then click on show results.
+[6] Click on Easy Apply.
+[7] Workplace Type : Remote.
+[8] in job post list see 1st job 
+	-> If job role match in this ketwords(backend, fullstack, frontend, Java, software developer, software engineer) click on Easy Apply.
+		[1] Contact info just click next ->
+		[2] Resume Page just click next -> 
+		[3] Additional Questions -> 
+			-> if experience related any question insert : 5
+			-> If any question like Yes No select Yes.
+			-> if Work experience next just click next.
+			-> if Education just click next.
+			-> current salary : 30 LPA
+			-> Expected Salary : 50 LPA
+			-> Notice Period : Less than 15 days
+			-> total work experience : 5 Years
+			-> If any other question comes ask me in ui screen take input from me.
+			-> if review button comes click on that button.
+			-> If Submit application button comes click on that button.
+			-> after submit button in popup comes Not Now and Update Profile : select Not Now button.
+			-> delete this post by click cross sign in this applied post.
+			-> repeat this process for next.	
+	-> else delete post & repeat this process for next..
+------------------------------------------------------------------

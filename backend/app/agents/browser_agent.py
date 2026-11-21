@@ -36,6 +36,7 @@ import asyncio
 import json
 import os
 import re
+from collections.abc import Callable
 from pathlib import Path
 from urllib.parse import urlencode, urljoin, parse_qs, urlparse
 
@@ -944,6 +945,39 @@ def should_dismiss(match_score: int | float | None,
     return float(match_score) < threshold
 
 
+# Role keywords of the manual apply flow (README.md). Case-insensitive, whole words;
+# "back end"/"back-end", "full stack"/"full-stack" etc. count as the same keyword.
+ROLE_KEYWORD_PATTERNS: dict[str, re.Pattern[str]] = {
+    "backend": re.compile(r"\bback[\s-]?end\b", re.I),
+    "fullstack": re.compile(r"\bfull[\s-]?stack\b", re.I),
+    "frontend": re.compile(r"\bfront[\s-]?end\b", re.I),
+    "java": re.compile(r"\bjava\b", re.I),
+    "software developer": re.compile(r"\bsoftware[\s-]+developer\b", re.I),
+    "software engineer": re.compile(r"\bsoftware[\s-]+engineer\b", re.I),
+}
+
+
+def title_matches_role(title: str) -> str | None:
+    """Return the first role keyword found in the job title, or None when none match."""
+    for keyword, pattern in ROLE_KEYWORD_PATTERNS.items():
+        if pattern.search(title or ""):
+            return keyword
+    return None
+
+
+# True once LinkedIn shows a job card as dismissed: the card says it won't be
+# recommended anymore, offers Undo, or is gone from the list.
+_DISMISSED_JS = """
+(jobId) => {
+  const card = document.querySelector(`[role="button"][componentkey="job-card-component-ref-${jobId}"]`);
+  if (!card) return !document.querySelector(`a[href*="/jobs/view/${jobId}/"]`);
+  const text = (card.innerText || '').toLowerCase();
+  return /recommend this job anymore|job dismissed/.test(text.replace(/\u2019/g, "'"))
+    || !!card.querySelector('button[aria-label^="Undo"], button[aria-label*="undo" i]');
+}
+"""
+
+
 async def dismiss_job(page, job_id: str) -> bool:
     """
     Dismiss a single LinkedIn job card identified by job_id.
@@ -1029,10 +1063,19 @@ async def dismiss_job(page, job_id: str) -> bool:
             )
             return False
 
-        await cursor_click(btn)
-        print(f"[dismiss] job_id={job_id}: dismissed ({aria_label!r}).",
-              flush=True)
-        return True
+        # A click can be swallowed (e.g. by a closing dialog), so confirm that
+        # LinkedIn shows the dismissed state; retry the click once if not.
+        for attempt in (1, 2):
+            await cursor_click(btn)
+            for _ in range(6):
+                await page.wait_for_timeout(500)
+                if await page.evaluate(_DISMISSED_JS, job_id):
+                    print(f"[dismiss] job_id={job_id}: dismissed ({aria_label!r}).", flush=True)
+                    return True
+            if attempt == 1 and not await btn.is_visible():
+                break
+        print(f"[dismiss] job_id={job_id}: clicked, but LinkedIn did not show it as dismissed.", flush=True)
+        return False
 
     except Exception as exc:
         print(f"[dismiss] job_id={job_id}: error — {exc}", flush=True)
@@ -1381,10 +1424,27 @@ async def _apply_screening_answer(
         target = _resolve_option(answer, options)
         if target is None:
             return False
-        option = ctl.get_by_label(target, exact=True).first
+        # Options were read in input order; select by position, because LinkedIn's
+        # option <label>s can be empty (the text sits in a sibling element).
+        inputs = ctl.locator('input[type="radio"], input[type="checkbox"]')
+        matches = [i for i, o in enumerate(options) if o.strip().casefold() == target.strip().casefold()]
+        if len(matches) != 1 or await inputs.count() != len(options):
+            return False
+        option = inputs.nth(matches[0])
         if not await option.is_checked():
+            # LinkedIn renders the real <input> off-screen behind a styled <label>,
+            # so Playwright cannot check it directly: click the label, then fall
+            # back to a DOM click on the input. Verified by is_checked() below.
             await cursor_move(ctl)
-            await option.check(force=True, timeout=3_000)
+            option_id = await option.get_attribute("id")
+            label = page.locator(f'label[for="{option_id}"]').first if option_id else None
+            if label is not None and await label.count():
+                try:
+                    await label.click(timeout=3_000)
+                except Exception:
+                    pass
+            if not await option.is_checked():
+                await option.evaluate("el => el.click()")
         return await option.is_checked()
 
     if input_type == "checkbox":  # single checkbox
@@ -1403,6 +1463,36 @@ async def _apply_screening_answer(
     return (await ctl.input_value(timeout=3_000)).strip().casefold() == answer.casefold()
 
 
+# Shared JS helpers for radio/checkbox groups. LinkedIn's current markup is a
+# <fieldset role="radiogroup"> without <legend>: the question is the preceding
+# <p> (ending in "*") or the inputs' aria-label, and option <label>s are empty
+# with the option text in a nearby <p>.
+_GROUP_TEXT_JS = """
+  const _txt = e => ((e && e.textContent) || '').replace(/\\s+/g, ' ').trim();
+  const groupQuestion = (fs, inputs) => {
+    const legend = fs.querySelector('legend');
+    if (_txt(legend)) return _txt(legend);
+    if ((fs.getAttribute('aria-label') || '').trim()) return fs.getAttribute('aria-label').trim();
+    const by = (fs.getAttribute('aria-labelledby') || '').split(/\\s+/)
+      .map(id => document.getElementById(id)).filter(Boolean).map(_txt).join(' ').trim();
+    if (by) return by;
+    const prev = fs.previousElementSibling;
+    if (_txt(prev) && _txt(prev).length <= 500) return _txt(prev);
+    return (inputs[0] && inputs[0].getAttribute('aria-label') || '').trim();
+  };
+  const optionText = (inp, fs, labels) => {
+    const lbl = labels.find(l => l.htmlFor === inp.id);
+    if (_txt(lbl)) return _txt(lbl);
+    // Widen from the input to the largest ancestor holding only this option.
+    let el = inp;
+    while (el.parentElement && el.parentElement !== fs
+           && el.parentElement.querySelectorAll('input[type="radio"], input[type="checkbox"]').length === 1) {
+      el = el.parentElement;
+    }
+    return _txt(el) || (inp.value || '').trim();
+  };
+"""
+
 # Scans the open Easy Apply modal for REQUIRED controls that are unanswered or
 # invalid. Required = native `required`, aria-required, or a visible "*" /
 # "(required)" marker on the label/legend. Placeholder dropdown options and
@@ -1410,6 +1500,7 @@ async def _apply_screening_answer(
 # hidden/invisible controls are ignored. Contact fields are filtered by the caller.
 _REQUIRED_UNANSWERED_JS = """
 () => {
+""" + _GROUP_TEXT_JS + """
   const modal = document.querySelector('div[data-test-modal]')
     || document.querySelector('dialog[open]')
     || document.querySelector('[role="dialog"][aria-label*="Easy Apply"]')
@@ -1436,20 +1527,16 @@ _REQUIRED_UNANSWERED_JS = """
     if (!inputs.length) continue;
     groups.add(fs);
     if (!visible(fs)) continue;
-    const legend = fs.querySelector('legend');
-    const text = ((legend ? legend.textContent : fs.getAttribute('aria-label')) || '').trim();
+    const text = groupQuestion(fs, inputs);
     const required = fs.getAttribute('aria-required') === 'true'
       || inputs.some(i => i.required || i.getAttribute('aria-required') === 'true')
       || marked(text);
     if (!required || inputs.some(i => i.checked)) continue;
     out.push({
-      question: text || fs.id,
+      question: text.replace(/\\s*\\*\\s*$/, '') || fs.id,
       input_type: inputs[0].getAttribute('type'),
       control_id: ensureId(fs, 'ea-screening-group-'),
-      options: inputs.map(inp => {
-        const lbl = labels.find(l => l.htmlFor === inp.id);
-        return (lbl ? lbl.textContent : inp.value || '').trim();
-      }),
+      options: inputs.map(inp => optionText(inp, fs, labels)),
     });
   }
 
@@ -1513,6 +1600,7 @@ async def handle_screening_questions(
     resume_text: str,
     db,
     user_id: int | None = None,
+    profile: dict | None = None,
 ) -> dict:
     """
     Extract visible screening questions from the active Easy Apply modal,
@@ -1536,9 +1624,10 @@ async def handle_screening_questions(
 
     Rules
     -----
-    - Never invents answers or auto-selects "Yes".
-    - Only fills an answer when it comes from a saved user-confirmed record
-      or is explicitly present as a numeric/factual value in the resume text.
+    - Never invents answers.
+    - Only fills an answer when it comes from a saved user-confirmed record or
+      from the user's configured defaults (apply_defaults: salary, notice period,
+      experience, and "Yes" only for covered skills / remote / start date).
     - Leaves ambiguous or unknown questions in pending_questions.
     - Does not click Next, Review, or Submit.
     """
@@ -1585,6 +1674,7 @@ async def handle_screening_questions(
     # from the modal, without touching the DOM destructively.
     extract_js = """
     () => {
+    """ + _GROUP_TEXT_JS + """
         const modalSels = [
             'div[data-test-modal]',
             'dialog[open]',
@@ -1611,18 +1701,15 @@ async def handle_screening_questions(
             const inputs = Array.from(fs.querySelectorAll(GROUP_INPUTS));
             if (!inputs.length) continue;
             groups.add(fs);
-            const legend = fs.querySelector('legend');
-            const text = ((legend ? legend.textContent : fs.getAttribute('aria-label')) || '').trim();
+            const text = groupQuestion(fs, inputs).replace(/\\s*\\*\\s*$/, '');
             if (!text) continue;
             if (!fs.id) fs.id = 'ea-screening-group-' + (n++);
+            const fsLabels = Array.from(fs.querySelectorAll('label'));
             questions.push({
                 question: text,
                 input_type: inputs[0].getAttribute('type'),
                 control_id: fs.id,
-                options: inputs.map(inp => {
-                    const lbl = fs.querySelector(`label[for="${CSS.escape(inp.id)}"]`);
-                    return (lbl ? lbl.textContent : inp.value || '').trim();
-                }),
+                options: inputs.map(inp => optionText(inp, fs, fsLabels)),
             });
         }
 
@@ -1714,8 +1801,19 @@ async def handle_screening_questions(
             except Exception as exc:
                 errors.append(f"DB lookup failed for '{q_text[:60]}': {exc}")
 
-        # 2. No saved answer — do NOT auto-generate one.
-        #    Leave it pending so the user can confirm.
+        # 2. User-provided defaults (salary, notice period, experience, covered
+        #    Yes/No) for questions they clearly cover; see apply_defaults.
+        if answer is None:
+            try:
+                from app.services.apply_defaults import default_answer
+                answer = default_answer(q_text, input_type, options, profile)
+                if answer is not None:
+                    provenance = "user_default"
+            except ImportError:
+                pass
+
+        # 3. Still no answer: do NOT generate one. Leave it pending so the
+        #    user can answer in the UI.
         if answer is None:
             pending.append({
                 "question": q_text,
@@ -1725,7 +1823,7 @@ async def handle_screening_questions(
             })
             continue
 
-        # 3. Apply the verified answer; anything not applied and verified goes
+        # 4. Apply the verified answer; anything not applied and verified goes
         #    back to the user through pending_questions.
         try:
             applied = await _apply_screening_answer(
@@ -2021,7 +2119,7 @@ async def _is_logged_in(page) -> bool:
     return any(c.get("name") == "li_at" and c.get("value") for c in cookies)
 
 
-async def _ensure_logged_in(page) -> None:
+async def _ensure_logged_in(page, on_login_wait: Callable[[str], None] | None = None) -> None:
     """
     Open linkedin.com and, if the user is not signed in, wait (bounded) for them to
     sign in manually in this same browser, then return so the workflow continues.
@@ -2039,6 +2137,7 @@ async def _ensure_logged_in(page) -> None:
     loop = asyncio.get_running_loop()
     deadline = loop.time() + LOGIN_WAIT_TIMEOUT_S
     announced = False
+    checks = 0
     while True:
         url = page.url
         if _RESTRICTED_URL_RE.search(url) and not _AUTH_URL_RE.search(url):
@@ -2051,8 +2150,15 @@ async def _ensure_logged_in(page) -> None:
             raise SearchError("access_restricted", "LinkedIn restricted access. Resolve it manually in the agent browser and retry.")
         if await _is_logged_in(page):
             return
-        if not announced:
-            print(f"[auth] Not logged in. Sign in to LinkedIn in the agent browser (waiting up to {LOGIN_WAIT_TIMEOUT_S}s).", flush=True)
+        # Signed-in members are redirected from "/" to /feed/ after load, so the
+        # first check can fail spuriously; only announce after a second check.
+        if not announced and checks == 0:
+            checks += 1
+        elif not announced:
+            wait_msg = f"Not logged in. Sign in to LinkedIn in the agent browser (waiting up to {LOGIN_WAIT_TIMEOUT_S}s)."
+            print(f"[auth] {wait_msg}", flush=True)
+            if on_login_wait is not None:
+                on_login_wait(wait_msg)
             announced = True
         if loop.time() >= deadline:
             raise SearchError(
@@ -2061,6 +2167,112 @@ async def _ensure_logged_in(page) -> None:
                 "Sign in to LinkedIn in the agent browser and retry.",
             )
         await asyncio.sleep(_LOGIN_POLL_S)
+
+
+_DATE_LABELS = {"r86400": "Past 24 hours", "r604800": "Past week", "r2592000": "Past month"}
+
+
+def search_keywords(keywords: str, remote_only: bool) -> str:
+    """LinkedIn's AI job search treats the Remote filter as a hint, so say it in the text too."""
+    if remote_only and "remote" not in keywords.lower():
+        return f"{keywords} remote"
+    return keywords
+
+
+async def _filter_popover(page, must_contain: str):
+    """The open filter dropdown: the visible panel with a "Show results" button and the option."""
+    # Matched by visible text: the button's accessible name can differ from its label.
+    panels = page.locator("div").filter(
+        has=page.locator("button", has_text="Show results")
+    ).filter(has_text=must_contain)
+    count = await panels.count()
+    for i in range(count - 1, -1, -1):  # innermost (last) match first
+        panel = panels.nth(i)
+        if await panel.is_visible():
+            return panel
+    raise RuntimeError(f"the '{must_contain}' options did not open")
+
+
+async def _filter_pill(page, text: str):
+    """A filter-bar pill (LinkedIn renders them as <label>s), matched by its exact text."""
+    pill = page.locator("label, button").filter(
+        has_text=re.compile(rf"^\s*{re.escape(text)}\s*$")
+    ).first
+    await pill.wait_for(state="visible", timeout=15_000)
+    return pill
+
+
+async def _search_by_clicking(
+    page,
+    keywords: str,
+    date_posted: str,
+    easy_apply: bool,
+    remote_only: bool,
+    on_progress: Callable[[str], None] | None = None,
+) -> None:
+    """
+    Run the job search the way a user does (README.md manual flow, steps 3-7): type the
+    keywords, click Jobs, set Date posted, Easy Apply and Workplace type one by one.
+    Raises RuntimeError naming the step that failed.
+    """
+    def note(message: str) -> None:
+        print(f"[search] {message}", flush=True)
+        if on_progress is not None:
+            on_progress(message)
+
+    step = "type the search keywords"
+    try:
+        box = page.get_by_role("combobox", name="Search").or_(page.get_by_placeholder("Search")).first
+        await box.wait_for(state="visible", timeout=15_000)
+        await cursor_click(box)
+        await box.fill(keywords)
+        await page.keyboard.press("Enter")
+        await page.wait_for_url(re.compile(r"/search/results/"), timeout=30_000)
+        note(f"Searched for '{keywords}'")
+
+        step = "click the Jobs tab"
+        await cursor_click(await _filter_pill(page, "Jobs"))
+        await page.wait_for_url(re.compile(r"/jobs/search"), timeout=30_000)
+        await page.wait_for_selector(_CARD_SELECTOR, timeout=30_000)
+        note("Opened the Jobs tab")
+
+        date_label = _DATE_LABELS.get(date_posted)
+        if date_label:
+            step = f"set Date posted to {date_label}"
+            await cursor_click(await _filter_pill(page, "Date posted"))
+            panel = await _filter_popover(page, date_label)
+            await cursor_click(panel.get_by_text(date_label, exact=True).first)
+            await cursor_click(panel.locator("button", has_text="Show results").first)
+            await page.wait_for_timeout(3_000)
+            note(f"Date posted: {date_label}")
+
+        if easy_apply:
+            step = "turn on Easy Apply"
+            await cursor_click(await _filter_pill(page, "Easy Apply"))
+            await page.wait_for_timeout(3_000)
+            note("Easy Apply: on")
+
+        if remote_only:
+            step = "set Workplace type to Remote"
+            await cursor_click(await _filter_pill(page, "Workplace type"))
+            panel = await _filter_popover(page, "Hybrid")
+            await cursor_click(panel.get_by_text("Remote", exact=True).first)
+            await cursor_click(panel.locator("button", has_text="Show results").first)
+            await page.wait_for_timeout(3_000)
+            note("Workplace type: Remote")
+    except SearchError:
+        raise
+    except Exception as exc:
+        raise RuntimeError(f"could not {step}: {str(exc).splitlines()[0][:150]}") from exc
+
+
+def _with_start(url: str, start: int) -> str:
+    """The same search URL on another results page (LinkedIn's `start` offset)."""
+    parts = urlparse(url)
+    query = {k: v for k, v in parse_qs(parts.query).items() if k not in ("start", "currentJobId")}
+    if start:
+        query["start"] = [str(start)]
+    return parts._replace(query=urlencode(query, doseq=True)).geturl()
 
 
 async def iter_search_page_jobs(
@@ -2073,6 +2285,8 @@ async def iter_search_page_jobs(
     fetch_descriptions: bool = True,
     start_page: int = 0,
     progress: dict | None = None,
+    on_login_wait: Callable[[str], None] | None = None,
+    on_progress: Callable[[str], None] | None = None,
 ):
     """
     Async generator over job cards rendered by LinkedIn's Jobs search UI in
@@ -2087,23 +2301,44 @@ async def iter_search_page_jobs(
     if seen_ids is None:
         seen_ids = set()
 
-    await _ensure_logged_in(page)
+    await _ensure_logged_in(page, on_login_wait)
 
     # Pagination: LinkedIn pages are selected with the `start` URL offset (PAGE_SIZE per
     # page). The caller's `progress["page"]` is kept current so a paused scan can resume
     # on the same page; already processed ids are skipped through `seen_ids`.
+    keywords = search_keywords(keywords, remote_only)
+    # First page: search like a user, clicking each filter (manual flow). Later
+    # pages reuse the resulting LinkedIn URL with a `start` offset. If a click
+    # fails (LinkedIn changed its UI), fall back to the equivalent search URL.
+    clicked_url: str | None = None
+    if start_page == 0:
+        try:
+            await _search_by_clicking(page, keywords, date_posted, easy_apply, remote_only, on_progress)
+            clicked_url = page.url
+        except RuntimeError as exc:
+            message = f"Searching by clicking failed ({exc}); opening the search link instead."
+            print(f"[search] {message}", flush=True)
+            if on_progress is not None:
+                on_progress(message)
+
     page_index = start_page
     prev_page_ids: set[str] = set()
     while page_index < _MAX_SEARCH_PAGES:
         if progress is not None:
             progress["page"] = page_index
-        search_url = _build_browser_search_url(
-            keywords=keywords, date_posted=date_posted,
-            easy_apply=easy_apply, remote_only=remote_only,
-            start=page_index * PAGE_SIZE,
-        )
+        if clicked_url and page_index == 0:
+            search_url = None  # already on the clicked results page
+        elif clicked_url:
+            search_url = _with_start(clicked_url, page_index * PAGE_SIZE)
+        else:
+            search_url = _build_browser_search_url(
+                keywords=keywords, date_posted=date_posted,
+                easy_apply=easy_apply, remote_only=remote_only,
+                start=page_index * PAGE_SIZE,
+            )
         try:
-            await page.goto(search_url, wait_until="domcontentloaded", timeout=30_000)
+            if search_url is not None:
+                await page.goto(search_url, wait_until="domcontentloaded", timeout=30_000)
         except Exception as exc:
             if page_index > 0:
                 # Later pages: stop safely, keeping what was already scanned.

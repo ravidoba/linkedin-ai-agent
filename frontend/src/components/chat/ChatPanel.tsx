@@ -3,6 +3,7 @@ import {
   ApiError,
   apiRequest,
   sendAgentPrompt,
+  stopRun,
   type AgentReply,
   type AgentResume,
 } from "../../services/api";
@@ -10,6 +11,8 @@ import PromptComposer from "./PromptComposer";
 import NeedsInputForm from "./NeedsInputForm";
 import { useResume } from "../../hooks/useResume";
 import AgentActivityTimeline from "../activity/AgentActivityTimeline";
+import RunLogs from "../activity/RunLogs";
+import ProfilePanel from "../profile/ProfilePanel";
 import type {
   AgentActivityEvent,
   AgentExecutionState,
@@ -30,6 +33,11 @@ export default function ChatPanel({
   const [sending, setSending] = useState(false);
   const [lastReply, setLastReply] = useState<AgentReply | null>(null);
   const [notice, setNotice] = useState("");
+  const [askingJobCount, setAskingJobCount] = useState(false);
+  const [jobCount, setJobCount] = useState("");
+  const [showLogs, setShowLogs] = useState(false);
+  const [showProfile, setShowProfile] = useState(false);
+  const [stopping, setStopping] = useState(false);
 
   const inFlight = useRef(false);
   const pollingRef = useRef(false);
@@ -47,9 +55,20 @@ export default function ChatPanel({
       try {
         const result = (await apiRequest(
           `/browser/activity?after=${lastActivityId.current}`,
-        )) as { events?: AgentActivityEvent[] };
+        )) as { events?: AgentActivityEvent[]; last_id?: number };
 
         if (!active || !Array.isArray(result.events)) return;
+
+        // The backend's event ids restart at 1 after a backend restart; without
+        // this reset, new events would stay hidden until the page is reloaded.
+        if (
+          typeof result.last_id === "number" &&
+          result.last_id < lastActivityId.current
+        ) {
+          lastActivityId.current = 0;
+          setEvents([]);
+          return; // the next poll fetches the new events from the start
+        }
 
         const incoming = result.events
           .filter((event) => Number.isFinite(Number(event.id)))
@@ -100,6 +119,7 @@ export default function ChatPanel({
   async function run(
     prompt: string,
     resumeData?: AgentResume,
+    jobCount?: number,
   ): Promise<boolean> {
     if (inFlight.current || sending || resume.busy) {
       return false;
@@ -116,6 +136,7 @@ export default function ChatPanel({
         conversationId,
         undefined,
         resumeData,
+        jobCount,
       );
 
       setLastReply(reply);
@@ -148,7 +169,47 @@ export default function ChatPanel({
     void run("Continue the paused application", data);
   }
 
+  const parsedJobCount = Number(jobCount);
+  const jobCountValid =
+    /^\d+$/.test(jobCount.trim()) && parsedJobCount > 0;
+
+  function handleStart() {
+    if (!jobCountValid || inFlight.current || sending) return;
+    // Mirrors the manual flow in README.md; submission still needs approval.
+    const prompt =
+      `Apply to Java jobs: scan ${parsedJobCount} job postings, ` +
+      "posted in the past 24 hours, remote only, Easy Apply.";
+    void run(prompt, undefined, parsedJobCount).then((success) => {
+      if (success) {
+        setAskingJobCount(false);
+        setJobCount("");
+      }
+    });
+  }
+
   const status = lastReply?.status;
+  const runPaused = status === "needs_input" || status === "awaiting_approval";
+
+  async function handleStop() {
+    setStopping(true);
+    try {
+      const result = await stopRun();
+      if (result === "stopped") {
+        setLastReply(null); // hide the question / approval forms of the ended run
+        setNotice("Run stopped. The paused application was not submitted.");
+      } else if (result === "stopping") {
+        setNotice("Stopping after the current job. Nothing is submitted halfway.");
+      } else {
+        setNotice("No run is active.");
+      }
+    } catch (error) {
+      setNotice(
+        error instanceof Error ? `Could not stop the run: ${error.message}` : "Could not stop the run.",
+      );
+    } finally {
+      setStopping(false);
+    }
+  }
 
   const displayedEvents = activityEvents ?? events;
   const latest = displayedEvents[displayedEvents.length - 1];
@@ -174,10 +235,19 @@ export default function ChatPanel({
     <section className="flex h-full min-h-0 min-w-0 flex-col overflow-hidden bg-[#171717] text-[#F5F5F5]">
       {/* Agent Activity uses all available remaining height */}
       <div className="min-h-0 flex-1 overflow-hidden">
-        <AgentActivityTimeline
-          events={displayedEvents}
-          executionState={executionState ?? derivedState}
-        />
+        {showProfile ? (
+          <ProfilePanel
+            resumeId={resume.activeResume?.id ?? null}
+            onClose={() => setShowProfile(false)}
+          />
+        ) : showLogs ? (
+          <RunLogs onClose={() => setShowLogs(false)} />
+        ) : (
+          <AgentActivityTimeline
+            events={displayedEvents}
+            executionState={executionState ?? derivedState}
+          />
+        )}
       </div>
 
       {/* Required screening questions */}
@@ -216,6 +286,91 @@ export default function ChatPanel({
           {notice}
         </div>
       )}
+
+      {/* Start the automated apply flow */}
+      <div className="flex shrink-0 flex-wrap items-center gap-2 border-t border-[#353535] px-3 py-2 text-sm">
+        {!askingJobCount ? (
+          <button
+            type="button"
+            disabled={sending || resume.busy}
+            onClick={() => setAskingJobCount(true)}
+            className="rounded border border-[#353535] px-3 py-1.5 hover:bg-[#353535] disabled:cursor-not-allowed disabled:opacity-40"
+          >
+            Start
+          </button>
+        ) : (
+          <form
+            className="flex flex-wrap items-center gap-2"
+            onSubmit={(event) => {
+              event.preventDefault();
+              handleStart();
+            }}
+          >
+            <label htmlFor="job-count-input">
+              How many job posts do you want to process?
+            </label>
+            <input
+              id="job-count-input"
+              type="number"
+              min={1}
+              step={1}
+              value={jobCount}
+              onChange={(event) => setJobCount(event.target.value)}
+              className="w-20 rounded border border-[#353535] bg-[#262626] px-2 py-1"
+              autoFocus
+            />
+            <button
+              type="submit"
+              disabled={!jobCountValid || sending || resume.busy}
+              className="rounded border border-[#353535] px-3 py-1.5 hover:bg-[#353535] disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              Run
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setAskingJobCount(false);
+                setJobCount("");
+              }}
+              className="px-2 py-1.5 text-[#A3A3A3] hover:text-white"
+            >
+              Cancel
+            </button>
+          </form>
+        )}
+        {(sending || runPaused) && (
+          <button
+            type="button"
+            onClick={() => void handleStop()}
+            disabled={stopping}
+            className="rounded border border-red-400/50 px-3 py-1.5 text-red-300 hover:bg-red-900/30 disabled:cursor-not-allowed disabled:opacity-40"
+          >
+            {stopping ? "Stopping..." : "Stop"}
+          </button>
+        )}
+        <button
+          type="button"
+          onClick={() => {
+            setShowProfile((open) => !open);
+            setShowLogs(false);
+          }}
+          aria-pressed={showProfile}
+          className="ml-auto rounded border border-[#353535] px-3 py-1.5 hover:bg-[#353535]"
+        >
+          {showProfile ? "Hide profile" : "Profile"}
+        </button>
+        <button
+          type="button"
+          onClick={() => {
+            setShowLogs((open) => !open);
+            setShowProfile(false);
+          }}
+          aria-pressed={showLogs}
+          className="rounded border border-[#353535] px-3 py-1.5 hover:bg-[#353535]"
+        >
+          {showLogs ? "Hide logs" : "Logs"}
+        </button>
+      </div>
 
       {/* Compact composer pinned to bottom */}
       <div className="z-10 w-full shrink-0 border-t border-[#353535] bg-[#171717]">

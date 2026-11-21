@@ -2,6 +2,7 @@
 from datetime import datetime
 
 from sqlalchemy import (
+    JSON,
     DateTime,
     Float,
     ForeignKey,
@@ -33,6 +34,9 @@ class Job(Base):
     job_url: Mapped[str | None] = mapped_column(Text)
 
     match_score: Mapped[float | None] = mapped_column(Float)
+    # Read once from the description by the AI model and reused for this LinkedIn
+    # job ID: {"required_skills": [...], "min_years": 3, "education_level": "bachelor"}
+    requirements: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
     status: Mapped[str] = mapped_column(
         String(50), default="new"

@@ -32,6 +32,12 @@ export interface AgentActivityEvent {
   job?: ActivityJobDetails;
   /** Only set when the backend supplied a real match score (0-100). */
   matchScore?: number;
+  /** Set during an apply run: current job number out of the total to process. */
+  progress?: { current: number; total: number };
+  /** Easy Apply form step name, e.g. "Contact info", "Resume", "Review". */
+  step?: string;
+  /** Final outcome of a job, set on the event that ends its processing. */
+  result?: "Applied" | "Skipped" | "Failed";
 }
 
 export type AgentExecutionState = "idle" | "running" | "waiting" | "completed" | "failed";

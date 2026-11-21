@@ -11,7 +11,7 @@ async def ask_ollama(prompt: str) -> str:
         response = await client.post(
             f"{settings.OLLAMA_BASE_URL.rstrip('/')}/api/chat",
             json={
-                "model": "qwen3:4b-instruct-2507-q4_K_M",
+                "model": settings.OLLAMA_MODEL,
                 "messages": [
                     {
                         "role": "system",

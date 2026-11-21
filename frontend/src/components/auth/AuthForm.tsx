@@ -11,6 +11,7 @@ export default function AuthForm({ onAuthenticated }: AuthFormProps) {
   const [fullName, setFullName] = useState("");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
+  const [showPassword, setShowPassword] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
@@ -60,16 +61,27 @@ export default function AuthForm({ onAuthenticated }: AuthFormProps) {
           value={email}
           onChange={(e) => setEmail(e.target.value)}
         />
-        <input
-          className={input}
-          type="password"
-          placeholder={mode === "signup" ? "Password (min 12 characters)" : "Password"}
-          autoComplete={mode === "login" ? "current-password" : "new-password"}
-          minLength={mode === "signup" ? 12 : undefined}
-          required
-          value={password}
-          onChange={(e) => setPassword(e.target.value)}
-        />
+        <div className="relative">
+          <input
+            className={`${input} pr-16`}
+            type={showPassword ? "text" : "password"}
+            placeholder={mode === "signup" ? "Password (min 12 characters)" : "Password"}
+            autoComplete={mode === "login" ? "current-password" : "new-password"}
+            minLength={mode === "signup" ? 12 : undefined}
+            required
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+          />
+          <button
+            type="button"
+            onClick={() => setShowPassword((shown) => !shown)}
+            aria-label={showPassword ? "Hide password" : "Show password"}
+            aria-pressed={showPassword}
+            className="absolute inset-y-0 right-0 px-3 text-xs text-[#A3A3A3] hover:text-[#F5F5F5]"
+          >
+            {showPassword ? "Hide" : "Show"}
+          </button>
+        </div>
         {error && <ErrorNotice message={error} onDismiss={() => setError(null)} />}
         <button
           type="submit"

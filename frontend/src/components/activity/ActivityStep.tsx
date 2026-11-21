@@ -1,6 +1,6 @@
 import type { ActivityStatus, ActivityType, AgentActivityEvent } from "./types";
 
-const TYPE_LABELS: Record<ActivityType, string> = {
+export const TYPE_LABELS: Record<ActivityType, string> = {
   searching_jobs: "Searching jobs",
   reading_job_description: "Reading job description",
   matching_resume: "Matching resume",

@@ -26,11 +26,18 @@ import asyncio
 import os
 import re
 import time
+import traceback
 from collections import deque
 from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.db.database import AsyncSessionLocal
+from app.models.agent_run_log import AgentRunLog
+from app.services.job_requirements_service import get_job_requirements
+from app.services.profile_matching_service import match_job_to_profile
+from app.services.resume_profile_service import get_or_build_profile
 
 from app.agents.browser_agent import (
     MATCH_THRESHOLD,
@@ -46,6 +53,7 @@ from app.agents.browser_agent import (
     SearchError,
     iter_search_page_jobs,
     open_easy_apply,
+    title_matches_role,
     resume_file_path,
     cursor_click,
     install_cursor,
@@ -83,18 +91,100 @@ _paused: dict[int, dict[str, Any]] = {}
 # In-memory per-user progress stream. Single backend worker only.
 _activity: dict[int, deque[dict[str, Any]]] = {}
 _activity_sequence: dict[int, int] = {}
+# user.id -> (current job number, total jobs to process) of the running apply scan.
+_job_progress: dict[int, tuple[int, int]] = {}
+# user.id -> job dict currently being processed, so an unexpected failure can be
+# reported as that job's "Failed" result.
+_current_job: dict[int, dict[str, Any]] = {}
+
+
+def _friendly_error(exc: Exception) -> tuple[str, str]:
+    """Plain-language message and error_type for an unexpected exception."""
+    name, text = type(exc).__name__, str(exc).lower()
+    if "closed" in text and ("target" in name.lower() or "browser" in text or "context" in text):
+        return "The agent browser was closed, so the run stopped. Nothing more was submitted.", "browser_closed"
+    if "timeout" in name.lower() or "timeout" in text:
+        return "LinkedIn took too long to respond, so the run stopped. Nothing more was submitted.", "navigation_timeout"
+    return (
+        f"An unexpected error stopped the run ({name}). Nothing more was submitted. "
+        "The server log has the details.",
+        "unexpected",
+    )
 _manual_owner_id: int | None = None
 
 
-def emit_activity(user_id: int, kind: str, status: str, message: str, job: dict | None = None, score: int | float | None = None) -> None:
+def emit_activity(user_id: int, kind: str, status: str, message: str, job: dict | None = None, score: int | float | None = None, step: str | None = None, result: str | None = None) -> None:
     seq = _activity_sequence.get(user_id, 0) + 1
     _activity_sequence[user_id] = seq
     event: dict[str, Any] = {"id": seq, "type": kind, "status": status, "message": message, "timestamp": int(time.time() * 1000)}
+    if user_id in _job_progress:
+        current, total = _job_progress[user_id]
+        event["progress"] = {"current": current, "total": total}
     if job:
         event["job"] = {"jobId": str(job.get("job_id", "")), "title": job.get("title", ""), "company": job.get("company", ""), "location": job.get("location", ""), "url": job.get("url", "")}
     if isinstance(score, (int, float)):
         event["matchScore"] = score
+    if step:
+        event["step"] = step
+    if result:
+        event["result"] = result  # final outcome of this job: Applied | Skipped | Failed
     _activity.setdefault(user_id, deque(maxlen=300)).append(event)
+    run_id = active_run_ids.get(user_id)
+    if run_id is not None:
+        try:
+            task = asyncio.get_running_loop().create_task(_save_run_log(run_id, event))
+        except RuntimeError:  # no event loop (e.g. CLI use): nothing to persist to
+            return
+        _log_tasks.add(task)
+        task.add_done_callback(_log_tasks.discard)
+
+
+# user.id -> AgentRun.id of the Start-button run in progress (set by the /ai/agent route).
+active_run_ids: dict[int, int] = {}
+# Strong references so pending log writes are not garbage-collected mid-flight.
+_log_tasks: set[asyncio.Task] = set()
+# user.id values whose running scan should stop before its next job (Stop button).
+_stop_requested: set[int] = set()
+
+
+def stop_run(user_id: int) -> str:
+    """
+    Stop the user's run safely. A paused application is discarded (nothing is
+    submitted) and "stopped" is returned; a running scan is asked to stop before
+    its next job and "stopping" is returned.
+    """
+    if _paused.pop(user_id, None) is not None:
+        _job_progress.pop(user_id, None)
+        emit_activity(user_id, "searching_jobs", "completed", "Stopped by you. The paused application was not submitted.")
+        return "stopped"
+    _stop_requested.add(user_id)
+    emit_activity(user_id, "searching_jobs", "running", "Stopping after the current job...")
+    return "stopping"
+
+
+async def _save_run_log(run_id: int, event: dict[str, Any]) -> None:
+    """Persist one activity event of a run; a failed write never stops the workflow."""
+    job = event.get("job") or {}
+    progress = event.get("progress") or {}
+    try:
+        async with AsyncSessionLocal() as session:
+            session.add(AgentRunLog(
+                run_id=run_id,
+                seq=event["id"],
+                type=event["type"],
+                status=event["status"],
+                message=event.get("message", ""),
+                step=event.get("step"),
+                result=event.get("result"),
+                job_number=progress.get("current"),
+                job_total=progress.get("total"),
+                linkedin_job_id=job.get("jobId") or None,
+                job_title=job.get("title") or None,
+                job_company=job.get("company") or None,
+            ))
+            await session.commit()
+    except Exception as exc:
+        print(f"[activity] run {run_id}: could not save log event {event.get('id')}: {exc}", flush=True)
 
 
 
@@ -341,6 +431,60 @@ _STEP_SIGNATURE_JS = """
 """
 
 
+# Title of the open Easy Apply step (e.g. "Contact info"). The dialog's own
+# title "Apply to <company>" is never used.
+_STEP_HEADING_JS = """
+() => {
+  const text = e => (e.textContent || '').replace(/\\s+/g, ' ').trim();
+  const shown = e => e.getClientRects().length > 0
+    && !/visually-hidden|sr-only|a11y-text/.test(e.className || '');
+  // The Easy Apply dialog is the one titled "Apply to <company>"; other dialogs
+  // on the page (e.g. notifications) must not be read.
+  const dialogs = Array.from(document.querySelectorAll(
+    '[role="dialog"][aria-label*="Easy Apply"], div[data-test-modal], dialog[open], [role="dialog"]'));
+  const easy = dialogs.find(d => Array.from(d.querySelectorAll('h1, h2, h3'))
+      .some(h => /^apply to\\b/i.test(text(h))))
+    || dialogs.find(d => /easy apply/i.test(d.getAttribute('aria-label') || ''));
+  if (!easy) return '';
+  // 1. A visible element whose text is (or starts with) a known step name,
+  //    whatever its tag (LinkedIn does not always use <h3> for the step title).
+  const KNOWN = /^(contact info|resume|additional questions|work experience|education|review your application|home address|voluntary self identification|work authorization|screening questions)\\b/i;
+  for (const e of easy.querySelectorAll('h1, h2, h3, h4, h5, h6, [role="heading"], span, p, div')) {
+    const t = text(e);
+    if (e.children.length <= 1 && t.length <= 60 && KNOWN.test(t) && shown(e)) return t;
+  }
+  // 2. Any other visible heading except the dialog title "Apply to <company>".
+  for (const e of easy.querySelectorAll('h3, h4, [role="heading"], h2')) {
+    const t = text(e);
+    if (t && shown(e) && !/^apply to\\b/i.test(t) && !/notification/i.test(t)) return t;
+  }
+  return '';
+}
+"""
+_STEP_LABELS = (
+    ("contact", "Contact info"),
+    ("resume", "Resume"),
+    ("work experience", "Work experience"),
+    ("education", "Education"),
+    ("review", "Review"),
+    ("question", "Additional questions"),
+    ("additional", "Additional questions"),
+)
+
+
+async def _form_step_label(page: Any) -> str:
+    """Readable name of the current Easy Apply step, e.g. "Contact info"."""
+    try:
+        heading = (await page.evaluate(_STEP_HEADING_JS) or "").strip()
+    except Exception:
+        heading = ""
+    lowered = heading.lower()
+    for needle, label in _STEP_LABELS:
+        if needle in lowered:
+            return label
+    return heading[:60] or "Application form"
+
+
 async def _step_signature(page: Any) -> str:
     try:
         return await page.evaluate(_STEP_SIGNATURE_JS)
@@ -504,6 +648,7 @@ async def _run_form(
     resume_text: str,
     user_approved: bool,
     skipped_jobs: list[str],
+    profile: dict | None = None,
 ) -> dict:
     """Fill the open Easy Apply modal, pause for input/approval, or submit."""
 
@@ -552,11 +697,13 @@ async def _run_form(
         "(not silently replaced). Nothing was submitted."
     )
 
+    step_label = await _form_step_label(page)
+    emit_activity(user.id, "filling_fields", "running", f"Step: {step_label}", scored, step=step_label)
     fill_result = await fill_easy_apply_fields(page, app_data)
     if fill_result.get("resume") == "failed":
         return _fail(resume_failed)
     resume_ok = resume_ok or fill_result.get("resume") in ("attached", "kept")
-    screening = await handle_screening_questions(page, resume_text, db, user.id)
+    screening = await handle_screening_questions(page, resume_text, db, user.id, profile)
     pending_qs = await _screening_pending(page, screening, fill_result)
     contact_missing = fill_result.get("required_missing", [])
 
@@ -571,16 +718,9 @@ async def _run_form(
             _contact_first(contact_missing, fill_result.get("missing", [])),
         )
 
-    if not user_approved:
-        return _pause(
-            "awaiting_approval",
-            "Form is ready. Approve to submit.",
-            [],
-            fill_result.get("filled", []),
-            [],
-        )
-
-    # --- Submit (only reached when user_approved=True). ---
+    # --- Walk the form with Next/Review; Submit is clicked only when user_approved.
+    # Without approval the run pauses on the page that shows Submit (the Review
+    # page), so the user approves the finished application. ---
     # Controls are looked up inside the Easy Apply modal only, so buttons of the page
     # behind it (e.g. result pagination "Next") are never clicked. Next/Review use
     # LinkedIn's aria-labels or the exact button text.
@@ -613,6 +753,15 @@ async def _run_form(
                         "Submit is disabled: LinkedIn reports the form is incomplete. "
                         "Nothing was submitted."
                     )
+                if not user_approved:
+                    return _pause(
+                        "awaiting_approval",
+                        "The application is complete and on the Review page. "
+                        "Approve to submit.",
+                        [],
+                        fill_result.get("filled", []),
+                        [],
+                    )
                 click_attempted = True
                 await cursor_click(submit_loc)
                 submitted = True  # one click only; confirmation is checked below
@@ -631,11 +780,13 @@ async def _run_form(
                     "The form did not advance after Next/Review (LinkedIn may be showing "
                     "a validation error). Nothing was submitted."
                 )
+            step_label = await _form_step_label(page)
+            emit_activity(user.id, "filling_fields", "running", f"Step: {step_label}", scored, step=step_label)
             step_fill = await fill_easy_apply_fields(page, app_data)
             if step_fill.get("resume") == "failed":
                 return _fail(resume_failed)
             resume_ok = resume_ok or step_fill.get("resume") in ("attached", "kept")
-            step_scr = await handle_screening_questions(page, resume_text, db, user.id)
+            step_scr = await handle_screening_questions(page, resume_text, db, user.id, profile)
             step_qs = await _screening_pending(page, step_scr, step_fill)
             step_contact = step_fill.get("required_missing", [])
             if step_qs or step_contact:
@@ -658,7 +809,10 @@ async def _run_form(
         return _fail(f"Submit step failed: {exc}")
 
     if not submitted:
-        return _fail("Submit button not found.")
+        return _fail(
+            "The Easy Apply form showed no Next, Review or Submit button, so it could not "
+            "continue (LinkedIn may have changed the form). Nothing was submitted."
+        )
 
     # --- Verify LinkedIn's actual submission confirmation (never retried). ---
     outcome, detail = await _await_submission(page)
@@ -737,6 +891,10 @@ async def run_apply_workflow(
     """
     if _manual_owner_id == user.id:
         return _result("error", message="Manual browser control is active. Return control to the agent first.")
+    if not resume_paused:
+        _job_progress.pop(user.id, None)  # a new run starts without job progress
+        _current_job.pop(user.id, None)
+        _stop_requested.discard(user.id)  # a Stop from an earlier run does not carry over
     emit_activity(user.id, "searching_jobs", "running", f"Starting {intent} workflow: {keywords}")
     async with _lock:
         try:
@@ -753,8 +911,23 @@ async def run_apply_workflow(
             emit_activity(user.id, "error" if status == "error" else "searching_jobs", "failed" if status == "error" else "completed", str(result.get("message", status))[:500])
             return result
         except Exception as exc:
-            emit_activity(user.id, "error", "failed", f"Workflow stopped: {type(exc).__name__}: {str(exc)[:300]}")
-            raise
+            # Unexpected failure (browser closed, LinkedIn changed, bug): never leak a
+            # raw exception to the user. Full details go to the server log.
+            traceback.print_exc()
+            message, error_type = _friendly_error(exc)
+            try:
+                await db.rollback()  # the session may be mid-transaction
+            except Exception:
+                pass
+            if error_type == "browser_closed":
+                _paused.pop(user.id, None)
+                await close_browser_session()  # the next run opens a fresh browser
+            job = _current_job.get(user.id)
+            if job is not None:
+                emit_activity(user.id, "error", "failed", message, job, result="Failed")
+            else:
+                emit_activity(user.id, "error", "failed", message)
+            return _result("error", message=message, error_type=error_type)
 
 
 async def _run_locked(
@@ -825,6 +998,7 @@ async def _run_locked(
     # --- 1. Load resume (not needed for search-only). ---
     resume: Resume | None = None
     resume_text = ""
+    profile: dict | None = None
     if intent != "search" or paused is not None:
         if resume_id is not None:
             resume = await db.scalar(
@@ -835,6 +1009,20 @@ async def _run_locked(
         resume_text = resume.content if resume else ""
         if not resume_text:
             return _result("error", message="No uploaded resume found for user.")
+        # Resume facts read once (skills, experience, education): used for matching
+        # and screening answers instead of re-reading the resume for every job.
+        profile = await get_or_build_profile(db, resume)
+        if profile is None:
+            emit_activity(user.id, "matching_resume", "waiting",
+                          "Your resume could not be read into a profile; using the slower AI matching.")
+
+    async def _score(job: dict, job_row: Job | None = None) -> dict:
+        """Match a job's cached requirements against the profile (plain code)."""
+        if profile is None:
+            return await score_job(job, resume_text, threshold=threshold)
+        row = job_row or await _upsert_job(db, job)
+        requirements = await get_job_requirements(db, row, job.get("description", ""))
+        return match_job_to_profile(job, requirements, profile, threshold)
 
     await _save_contact(db, user, applicant_data)
     app_data = _default_applicant_data(
@@ -871,6 +1059,7 @@ async def _run_locked(
     scanned = applied = failed = uncertain = 0
     last_applied: dict | None = None
     scan_blocked = False  # set when the post-submit dialog could not be closed
+    stopped = False  # set when the user pressed Stop
     progress: dict = {"page": 0}  # current results page, updated by the search generator
 
     def _summary() -> dict:
@@ -921,8 +1110,13 @@ async def _run_locked(
             app_data = paused["app_data"]
         outcome = await _run_form(
             db, user, page, job_row, paused["scored"], paused["app_data"],
-            resume, resume_text, form_approved, skipped_jobs,
+            resume, resume_text, form_approved, skipped_jobs, profile=profile,
         )
+        resumed_job = paused["scored"]
+        if outcome["status"] == "applied":
+            emit_activity(user.id, "application_submitted", "completed", str(outcome.get("message", ""))[:500], resumed_job, result="Applied")
+        elif outcome["status"] == "error":
+            emit_activity(user.id, "error", "failed", str(outcome.get("message", ""))[:500], resumed_job, result="Failed")
         if not scan:
             return _note_issues(outcome)
         if outcome["status"] != "applied":
@@ -943,6 +1137,12 @@ async def _run_locked(
         applied += 1
         last_applied = outcome
         scan_blocked = not await _dismiss_confirmation(page)
+        # Manual flow: remove the applied post from the list with its cross icon
+        # (after a short pause so the closing dialog cannot swallow the click).
+        if not scan_blocked:
+            await page.wait_for_timeout(1_000)
+        if not scan_blocked and not await dismiss_job(page, job_row.linkedin_job_id):
+            emit_activity(user.id, "dismissing_job", "completed", "Applied; the post could not be removed from the list.", resumed_job)
         # Fall through: continue the remaining scan on the same page.
     else:
         page = browser.pages[0] if browser.pages else await browser.new_page()
@@ -967,6 +1167,8 @@ async def _run_locked(
                 seen_ids=seen_ids,
                 start_page=progress["page"],
                 progress=progress,
+                on_login_wait=lambda msg: emit_activity(user.id, "searching_jobs", "waiting", msg),
+                on_progress=lambda msg: emit_activity(user.id, "searching_jobs", "running", msg),
             ):
                 yield item
                 # `scanned` is incremented by the consumer before it resumes us.
@@ -976,15 +1178,25 @@ async def _run_locked(
             search_errors.append(exc)
 
     async for job in _search_jobs():
+        # Stop button: checked only between jobs, never in the middle of a form.
+        if user.id in _stop_requested:
+            stopped = True
+            break
         scanned += 1
+        if intent == "apply":
+            _job_progress[user.id] = (scanned, max_results)
+            _current_job[user.id] = job
         job_id = job.get("job_id", "")
         emit_activity(user.id, "reading_job_description", "completed", f"Job {scanned}: inspecting posting", job)
+
+        def _skip_result(reason: str) -> None:
+            emit_activity(user.id, "dismissing_job", "completed", f"Job {scanned}: Skipped. {reason}", job, result="Skipped")
 
         # --- Search / match: never open Easy Apply or submit. ---
         if intent != "apply":
             if intent == "match":
                 emit_activity(user.id, "matching_resume", "running", f"Job {scanned}: checking resume match", job)
-                scored = await score_job(job, resume_text, threshold=threshold)
+                scored = await _score(job)
                 emit_activity(user.id, "matching_resume", "completed" if scored.get("eligible") else "waiting" if scored.get("needs_review") else "completed", "Eligible" if scored.get("eligible") else str(scored.get("match_reason") or "Not eligible"), job, scored.get("match_score"))
                 if not scored.get("eligible"):
                     skipped_jobs.append(job_id)
@@ -995,18 +1207,42 @@ async def _run_locked(
                 break
             continue
 
+        # --- Role keyword check on the job title (manual flow, README.md). ---
+        role_keyword = title_matches_role(job.get("title", ""))
+        emit_activity(
+            user.id, "matching_resume", "completed",
+            f"Job {scanned}: title matched '{role_keyword}'" if role_keyword
+            else f"Job {scanned}: title did not match any role keyword",
+            job,
+        )
+
         # --- Persist Job row. ---
         job_row = await _upsert_job(db, job)
 
+        # --- Title does not match any role keyword: dismiss the post, next job. ---
+        if not role_keyword:
+            job_row.status = "skipped_title"
+            if not await dismiss_job(page, job_id):
+                job_row.status = "skipped_title_no_dismiss"
+            await db.commit()
+            _skip_result(
+                "Title does not match the role keywords."
+                + ("" if job_row.status == "skipped_title" else " The post could not be dismissed.")
+            )
+            skipped_jobs.append(job_id)
+            continue
+
         # --- Skip already-applied jobs. ---
         if await _already_applied(db, user, job_row) or job.get("linkedin_applied"):
-            emit_activity(user.id, "dismissing_job", "completed", "Skipped: already applied", job)
+            # Manual flow: an applied post is removed from the list with its cross icon.
+            removed = await dismiss_job(page, job_id)
+            _skip_result("Already applied." + ("" if removed else " The post could not be removed from the list."))
             skipped_jobs.append(job_id)
             continue
 
         # --- Score. ---
-        emit_activity(user.id, "matching_resume", "running", f"Job {scanned}: scoring resume", job)
-        scored = await score_job(job, resume_text, threshold=threshold)
+        emit_activity(user.id, "matching_resume", "running", f"Job {scanned}: checking requirements against your profile", job)
+        scored = await _score(job, job_row)
         match_score = scored.get("match_score")
         emit_activity(user.id, "matching_resume", "completed" if scored.get("eligible") else "waiting" if scored.get("needs_review") else "completed", "Eligible" if scored.get("eligible") else str(scored.get("match_reason") or "Not eligible"), job, match_score)
 
@@ -1017,6 +1253,7 @@ async def _run_locked(
         # --- Skip unscorable/uncertain jobs (needs_review / None); never dismiss them. ---
         if match_score is None or scored.get("needs_review"):
             job_row.status = "skipped_unscorable"
+            _skip_result(str(scored.get("match_reason") or "Resume match could not be scored."))
             skipped_jobs.append(job_id)
             continue
 
@@ -1026,12 +1263,14 @@ async def _run_locked(
             dismissed = await dismiss_job(page, job_id)
             if not dismissed:
                 job_row.status = "skipped_no_dismiss"
+            _skip_result(str(scored.get("match_reason") or f"Resume match {match_score}% is below {threshold}%."))
             skipped_jobs.append(job_id)
             continue
 
         # --- Experience requirement not met (skills may be fine): skip, do not apply. ---
         if not scored.get("eligible"):
             job_row.status = "skipped_experience"
+            _skip_result(str(scored.get("match_reason") or "Experience requirement not met."))
             skipped_jobs.append(job_id)
             continue
 
@@ -1044,15 +1283,16 @@ async def _run_locked(
         if not await open_easy_apply(page, job_id):
             job_row.status = "easy_apply_unavailable"
             await db.commit()
+            _skip_result("Easy Apply is not available.")
             skipped_jobs.append(job_id)
             continue
 
         emit_activity(user.id, "filling_fields", "running", "Checking application form", job, match_score)
         outcome = await _run_form(
             db, user, page, job_row, scored, app_data, resume, resume_text,
-            user_approved, skipped_jobs,
+            user_approved, skipped_jobs, profile=profile,
         )
-        emit_activity(user.id, "application_submitted" if outcome["status"] == "applied" else "awaiting_approval" if outcome["status"] == "awaiting_approval" else "pending_questions" if outcome["status"] == "needs_input" else "error", "completed" if outcome["status"] == "applied" else "waiting" if outcome["status"] in ("awaiting_approval", "needs_input") else "failed", str(outcome.get("message", ""))[:500], job, match_score)
+        emit_activity(user.id, "application_submitted" if outcome["status"] == "applied" else "awaiting_approval" if outcome["status"] == "awaiting_approval" else "pending_questions" if outcome["status"] == "needs_input" else "error", "completed" if outcome["status"] == "applied" else "waiting" if outcome["status"] in ("awaiting_approval", "needs_input") else "failed", str(outcome.get("message", ""))[:500], job, match_score, result="Applied" if outcome["status"] == "applied" else "Failed" if outcome["status"] == "error" else None)
         if outcome["status"] == "applied":
             # Confirmed by LinkedIn and saved; continue with the next posting.
             applied += 1
@@ -1060,6 +1300,11 @@ async def _run_locked(
             if not await _dismiss_confirmation(page):
                 scan_blocked = True  # an open dialog would obstruct the next job
                 break
+            # Manual flow: remove the applied post from the list with its cross icon
+            # (after a short pause so the closing dialog cannot swallow the click).
+            await page.wait_for_timeout(1_000)
+            if not await dismiss_job(page, job_id):
+                emit_activity(user.id, "dismissing_job", "completed", f"Job {scanned}: applied; the post could not be removed from the list.", job)
             continue
         # needs_input / awaiting_approval keep the paused state (set in _run_form)
         # and error stops the run; never move on to another job from here.
@@ -1076,6 +1321,18 @@ async def _run_locked(
         outcome["summary"] = _summary()
         _remember_scan(outcome)
         return outcome
+
+    if stopped:
+        _stop_requested.discard(user.id)
+        return _result(
+            "stopped",
+            skipped_jobs=skipped_jobs,
+            message=(
+                f"Stopped by you after {scanned} job(s): {applied} applied, "
+                f"{len(skipped_jobs)} skipped, {failed} failed."
+            ),
+            summary=_summary(),
+        )
 
     if search_errors:
         err = search_errors[0]

@@ -2,6 +2,9 @@ from app.models.user import User
 from app.models.resume import Resume
 from app.models.application import Application
 from app.models.job import Job
+from app.models.agent_run import AgentRun
+from app.models.agent_run_log import AgentRunLog
+from app.models.resume_profile import ResumeProfile
 from app.core.config import get_settings
 from app.db.database import Base
 import asyncio
